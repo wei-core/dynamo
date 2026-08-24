@@ -8,7 +8,7 @@ import pytest
 
 try:
     from dynamo.common.http.url_validator import UrlValidationPolicy
-    from dynamo.common.protocols.video_protocol import NvCreateVideoRequest
+    from dynamo.common.protocols.video_protocol import NvCreateVideoRequest, VideoNvExt
     from dynamo.vllm.omni.video_references import VideoReferenceMaterializer
 except ImportError:
     pytest.skip("vLLM omni dependencies not available", allow_module_level=True)
@@ -155,3 +155,75 @@ def test_unknown_remote_suffix_uses_media_type_default():
     ).input_references[0]
 
     assert VideoReferenceMaterializer._suffix(reference) == ".mp4"
+
+
+@pytest.mark.parametrize(
+    ("task", "references", "message"),
+    [
+        (
+            "t2va",
+            [{"type": "image", "source": "data:image/png;base64,AA=="}],
+            "does not accept",
+        ),
+        (
+            "fl2va",
+            [{"type": "audio", "source": "data:audio/wav;base64,AA=="}],
+            "only one or two image",
+        ),
+        (
+            "ref2va",
+            [{"type": "audio", "source": "data:audio/wav;base64,AA=="}],
+            "at least one image or video",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rejects_invalid_h3_reference_contract(task, references, message):
+    with pytest.raises(ValueError, match=message):
+        request = NvCreateVideoRequest(
+            prompt="cat",
+            model="MiniMaxAI/MiniMax-H3",
+            input_references=references,
+            nvext=VideoNvExt(task=task),
+        )
+        await VideoReferenceMaterializer().materialize(request)
+
+
+@pytest.mark.parametrize(
+    ("references", "message"),
+    [
+        (
+            [{"type": "audio", "source": "data:audio/wav;base64,AA=="}],
+            "at least one image or video",
+        ),
+        (
+            [
+                {"type": "image", "source": f"data:image/png;base64,{index}A=="}
+                for index in range(3)
+            ],
+            "at most two image",
+        ),
+        (
+            [
+                {"type": "video", "source": f"data:video/mp4;base64,{index}A=="}
+                for index in range(4)
+            ],
+            "at most 3 video",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rejects_invalid_taskless_h3_contract_for_custom_alias(
+    references, message
+):
+    request = NvCreateVideoRequest(
+        prompt="cat",
+        model="h3",
+        input_references=references,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await VideoReferenceMaterializer().materialize(
+            request,
+            h3_task=request.infer_h3_task(),
+        )

@@ -14,8 +14,10 @@ from dynamo.common.http import HttpBodyTooLargeError, fetch_bytes
 from dynamo.common.http.url_validator import UrlValidationPolicy, validate_media_url
 from dynamo.common.multimodal.media_source import read_local_media_bytes
 from dynamo.common.protocols.video_protocol import (
+    H3Task,
     NvCreateVideoRequest,
     VideoInputReference,
+    is_minimax_h3_model_name,
 )
 
 _REFERENCE_LIMITS = {
@@ -85,7 +87,7 @@ class VideoReferenceMaterializer:
         self._url_policy = url_policy or UrlValidationPolicy.from_env()
 
     async def materialize(
-        self, request: NvCreateVideoRequest
+        self, request: NvCreateVideoRequest, *, h3_task: H3Task | None = None
     ) -> MaterializedVideoReferences | None:
         references = request.input_references
         if references is None:
@@ -95,6 +97,13 @@ class VideoReferenceMaterializer:
                 f"input_references accepts at most {_MAX_REFERENCE_COUNT} references"
             )
 
+        if h3_task is None and (
+            (request.nvext is not None and request.nvext.task is not None)
+            or is_minimax_h3_model_name(request.model)
+        ):
+            h3_task = request.infer_h3_task()
+        if h3_task is not None:
+            request.validate_h3_reference_contract(h3_task)
         temporary_directory = tempfile.TemporaryDirectory(
             prefix="dynamo_video_references_"
         )

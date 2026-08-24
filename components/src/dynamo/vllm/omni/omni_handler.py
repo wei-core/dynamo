@@ -28,7 +28,11 @@ from dynamo._core import Context
 from dynamo.common.multimodal import ImageLoader
 from dynamo.common.protocols.audio_protocol import NvCreateAudioSpeechRequest
 from dynamo.common.protocols.image_protocol import ImageNvExt, NvCreateImageRequest
-from dynamo.common.protocols.video_protocol import NvCreateVideoRequest, VideoNvExt
+from dynamo.common.protocols.video_protocol import (
+    H3Task,
+    NvCreateVideoRequest,
+    VideoNvExt,
+)
 from dynamo.common.rl import RLAdminValidationError
 from dynamo.common.utils.output_modalities import (
     RequestType,
@@ -57,8 +61,6 @@ from dynamo.vllm.omni.utils import (
 from dynamo.vllm.omni.video_references import VideoReferenceMaterializer
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_VIDEO_FPS = 16
 
 
 @dataclass
@@ -229,6 +231,39 @@ class OmniHandler(BaseOmniHandler):
             media_output_http_url=media_output_http_url,
         )
 
+    def _is_minimax_h3_model(self) -> bool:
+        """Return whether this worker serves a MiniMax-H3 checkpoint."""
+        get_diffusion_config = getattr(
+            self.engine_client, "get_diffusion_od_config", None
+        )
+        if callable(get_diffusion_config):
+            diffusion_config = get_diffusion_config()
+            model_class_name = getattr(diffusion_config, "model_class_name", None)
+            if isinstance(model_class_name, str):
+                return model_class_name in {
+                    "MiniMaxH3Pipeline",
+                    "MiniMaxH3ModularPipeline",
+                }
+
+        candidates = (
+            getattr(self.config, "model", None),
+            getattr(self.config, "served_model_name", None),
+            *(getattr(self.config, "served_model_aliases", ()) or ()),
+        )
+        return any(
+            "minimax-h3" in str(candidate).lower().replace("_", "-")
+            for candidate in candidates
+            if candidate
+        )
+
+    def _resolve_h3_task(self, request: NvCreateVideoRequest) -> H3Task | None:
+        """Resolve H3 from an explicit task or the loaded pipeline metadata."""
+        if request.nvext is not None and request.nvext.task is not None:
+            return request.nvext.task
+        if self._is_minimax_h3_model():
+            return request.infer_h3_task()
+        return None
+
     @functools.cached_property
     def _lora_enabled(self) -> bool:
         # Match non-Omni LoRA gating: engine must be started with LoRA support
@@ -333,6 +368,18 @@ class OmniHandler(BaseOmniHandler):
             parsed_request_raw,
         )
 
+        resolved_h3_task = None
+        if request_type == RequestType.VIDEO_GENERATION and isinstance(
+            parsed_request, NvCreateVideoRequest
+        ):
+            resolved_h3_task = self._resolve_h3_task(parsed_request)
+            if resolved_h3_task is not None:
+                try:
+                    parsed_request.validate_h3_reference_contract(resolved_h3_task)
+                except ValueError as e:
+                    yield self._error_chunk(request_id, str(e), request_type)
+                    return
+
         # Pre-load input image for I2V requests (async I/O before sync build)
         image = None
         materialized_references = None
@@ -363,7 +410,10 @@ class OmniHandler(BaseOmniHandler):
         ):
             try:
                 materialized_references = (
-                    await self._video_reference_materializer.materialize(parsed_request)
+                    await self._video_reference_materializer.materialize(
+                        parsed_request,
+                        h3_task=resolved_h3_task,
+                    )
                 )
             except Exception as e:
                 logger.warning("Failed to materialize input_references: %s", e)
@@ -380,7 +430,9 @@ class OmniHandler(BaseOmniHandler):
                 request_type,
                 image=image,
                 multi_modal_data=(
-                    materialized_references.as_omni_data()
+                    materialized_references.as_omni_data(
+                        allow_multiple=resolved_h3_task is not None
+                    )
                     if materialized_references is not None
                     else None
                 ),
@@ -738,15 +790,50 @@ class OmniHandler(BaseOmniHandler):
                 I2V pipeline pre-process can use it.
             multi_modal_data: Typed reference paths adapted for the pipeline.
         """
-        width, height = parse_size(req.size)
         nvext = req.nvext or VideoNvExt()
-        num_frames = compute_num_frames(
-            num_frames=nvext.num_frames,
-            seconds=req.seconds,
-            fps=nvext.fps,
-            default_fps=DEFAULT_VIDEO_FPS,
+        is_h3_request = nvext.task is not None or self._is_minimax_h3_model()
+        if is_h3_request and nvext.fps is not None and nvext.fps != 24:
+            raise ValueError("MiniMax-H3 fps is fixed at 24")
+
+        if req.size is None and is_h3_request:
+            width, height = None, None
+        else:
+            width, height = parse_size(req.size)
+
+        h3_task = nvext.task
+        if is_h3_request and h3_task is None:
+            if multi_modal_data is not None and (
+                multi_modal_data.get("video") is not None
+                or multi_modal_data.get("audio") is not None
+            ):
+                h3_task = "ref2va"
+            elif image is not None or (
+                multi_modal_data is not None
+                and multi_modal_data.get("image") is not None
+            ):
+                h3_task = "fl2va"
+            else:
+                h3_task = "t2va"
+
+        default_fps = (
+            24 if is_h3_request else getattr(self.config, "default_video_fps", 16)
         )
-        fps = nvext.fps if nvext.fps is not None else DEFAULT_VIDEO_FPS
+        fps = nvext.fps if nvext.fps is not None else default_fps
+
+        if nvext.duration is not None and nvext.num_frames is None:
+            num_frames = round(nvext.duration * fps)
+        elif is_h3_request and nvext.num_frames is None and req.seconds is None:
+            # Let H3 select its task-specific native length (209 frames for
+            # T2VA/FL2VA, 124 for Ref2VA) instead of injecting Dynamo's
+            # generic 97-frame default.
+            num_frames = None
+        else:
+            num_frames = compute_num_frames(
+                num_frames=nvext.num_frames,
+                seconds=req.seconds,
+                fps=nvext.fps,
+                default_fps=default_fps,
+            )
 
         prompt = OmniTextPrompt(prompt=req.prompt)
         if nvext.negative_prompt is not None:
@@ -782,6 +869,33 @@ class OmniHandler(BaseOmniHandler):
         self._update_if_not_none(sp, "boundary_ratio", nvext.boundary_ratio)
         self._update_if_not_none(sp, "guidance_scale_2", nvext.guidance_scale_2)
         self._update_if_not_none(sp, "fps", fps)
+        self._update_if_not_none(
+            sp, "num_outputs_per_prompt", nvext.num_outputs_per_prompt
+        )
+        self._update_if_not_none(sp, "quality", nvext.quality)
+
+        extra_args = {
+            key: value
+            for key, value in {
+                "task": nvext.task,
+                "duration": nvext.duration,
+                "flow_shift": nvext.flow_shift,
+                "audio_flow_shift": nvext.audio_flow_shift,
+                "aspect_ratio": (
+                    nvext.aspect_ratio
+                    if nvext.aspect_ratio is not None
+                    else "16:9"
+                    if is_h3_request and h3_task == "t2va"
+                    else None
+                ),
+                "short_edge": nvext.short_edge,
+                "frame_indices": nvext.frame_indices,
+                "start_time_seconds": nvext.start_time_seconds,
+            }.items()
+            if value is not None
+        }
+        if extra_args:
+            sp.extra_args.update(extra_args)
         sampling_params_list = self._build_sampling_params_list(sp)
         lora_request = self._resolve_and_apply_lora(req.model, sampling_params_list)
 

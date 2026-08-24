@@ -68,6 +68,102 @@ def test_video_request_rejects_invalid_reference_combinations(input_references):
         NvCreateVideoRequest(prompt="cat", model="video-model", **kwargs)
 
 
+def test_video_request_rejects_more_than_twelve_references():
+    with pytest.raises(ValueError, match="at most 12"):
+        NvCreateVideoRequest(
+            prompt="cat",
+            model="video-model",
+            input_references=[
+                {"type": "image", "source": f"https://example.com/{index}.png"}
+                for index in range(13)
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("task", "references", "nvext", "message"),
+    [
+        (
+            "t2va",
+            [{"type": "image", "source": "https://example.com/cat.png"}],
+            {},
+            "does not accept",
+        ),
+        (
+            "fl2va",
+            [{"type": "audio", "source": "https://example.com/cat.wav"}],
+            {},
+            "only one or two image",
+        ),
+        (
+            "fl2va",
+            [{"type": "image", "source": "https://example.com/cat.png"}],
+            {"frame_indices": [0, -1]},
+            "one frame index per image",
+        ),
+        (
+            "ref2va",
+            [{"type": "audio", "source": "https://example.com/cat.wav"}],
+            {},
+            "at least one image or video",
+        ),
+        (
+            "ref2va",
+            [{"type": "video", "source": "https://example.com/cat.mp4"}],
+            {"start_time_seconds": [0.0, 1.0]},
+            "one value per video",
+        ),
+    ],
+)
+def test_video_request_rejects_invalid_h3_reference_contract(
+    task, references, nvext, message
+):
+    with pytest.raises(ValueError, match=message):
+        NvCreateVideoRequest(
+            prompt="cat",
+            model="MiniMaxAI/MiniMax-H3",
+            input_references=references,
+            nvext={"task": task, **nvext},
+        )
+
+
+@pytest.mark.parametrize(
+    "references",
+    [
+        [{"type": "audio", "source": "https://example.com/cat.wav"}],
+        [
+            {"type": "image", "source": f"https://example.com/{index}.png"}
+            for index in range(3)
+        ],
+        [
+            {"type": "video", "source": f"https://example.com/{index}.mp4"}
+            for index in range(4)
+        ],
+    ],
+)
+def test_video_request_rejects_invalid_taskless_h3_reference_contract(references):
+    with pytest.raises(ValueError):
+        NvCreateVideoRequest(
+            prompt="cat",
+            model="MiniMaxAI/MiniMax-H3",
+            input_references=references,
+        )
+
+
+@pytest.mark.parametrize(
+    "nvext",
+    [
+        {"task": "t2va", "fps": 16},
+        {"task": "fl2va", "frame_indices": [1]},
+        {"task": "ref2va", "duration": 3},
+        {"task": "ref2va", "num_outputs_per_prompt": 11},
+    ],
+)
+def test_video_request_rejects_invalid_h3_controls(nvext):
+    with pytest.raises(ValueError):
+        NvCreateVideoRequest(prompt="cat", model="MiniMaxAI/MiniMax-H3", nvext=nvext)
+
+
 def test_video_response_wire_shape():
     response = NvVideosResponse(
         id="r1",

@@ -129,6 +129,23 @@ def test_omni_config_valid_boundary_ratio(ratio):
     config.validate()
 
 
+def test_negative_dlo_resident_layers_rejected():
+    config = _make_omni_config(dlo_resident_layers=-1)
+    with pytest.raises(ValueError, match="--dlo-resident-layers must be >= 0"):
+        config.validate()
+
+
+def test_resident_dlo_layers_reject_allgather():
+    config = _make_omni_config(dlo_resident_layers=1, dlo_use_allgather=True)
+    with pytest.raises(ValueError, match="--no-dlo-use-allgather"):
+        config.validate()
+
+
+def test_resident_dlo_layers_allow_sharded_reconstruction():
+    config = _make_omni_config(dlo_resident_layers=1, dlo_use_allgather=False)
+    config.validate()
+
+
 def test_negative_stage_id_rejected():
     config = _make_omni_config(stage_id=-1, stage_configs_path="/fake/path.yaml")
     with pytest.raises(ValueError, match="--stage-id must be >= 0"):

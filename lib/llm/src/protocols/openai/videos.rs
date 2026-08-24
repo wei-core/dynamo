@@ -8,7 +8,7 @@ use validator::{Validate, ValidationError};
 mod aggregator;
 mod nvext;
 
-pub use nvext::{NvExt, NvExtProvider};
+pub use nvext::{NvExt, NvExtProvider, StartTimeSeconds};
 
 /// Media type for a video-generation conditioning reference.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub struct NvCreateVideoRequest {
 
     /// NVIDIA extensions
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
     pub nvext: Option<NvExt>,
 }
 
@@ -110,6 +111,107 @@ fn validate_video_request(request: &NvCreateVideoRequest) -> Result<(), Validati
         .is_some_and(|references| references.is_empty())
     {
         return Err(ValidationError::new("input_references_empty"));
+    }
+    if request
+        .input_references
+        .as_ref()
+        .is_some_and(|references| references.len() > 12)
+    {
+        return Err(ValidationError::new("too_many_input_references"));
+    }
+
+    let mut image_count = usize::from(request.input_reference.is_some());
+    let mut video_count = 0;
+    let mut audio_count = 0;
+    for reference in request.input_references.iter().flatten() {
+        match reference.reference_type {
+            VideoInputReferenceType::Image => image_count += 1,
+            VideoInputReferenceType::Video => video_count += 1,
+            VideoInputReferenceType::Audio => audio_count += 1,
+        }
+    }
+    let total = image_count + video_count + audio_count;
+
+    let explicit_task = request
+        .nvext
+        .as_ref()
+        .and_then(|nvext| nvext.task.as_deref());
+    let is_named_h3 = request
+        .model
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .contains("minimax-h3");
+    if explicit_task.is_none() && !is_named_h3 {
+        return Ok(());
+    }
+    let task = explicit_task.unwrap_or({
+        if video_count != 0 || audio_count != 0 {
+            "ref2va"
+        } else if image_count != 0 {
+            "fl2va"
+        } else {
+            "t2va"
+        }
+    });
+
+    if request
+        .nvext
+        .as_ref()
+        .and_then(|nvext| nvext.fps)
+        .is_some_and(|fps| fps != 24)
+    {
+        return Err(ValidationError::new("invalid_h3_fps"));
+    }
+    if task == "fl2va"
+        && request
+            .nvext
+            .as_ref()
+            .and_then(|nvext| nvext.frame_indices.as_deref())
+            .is_some_and(|indices| !matches!(indices, [0] | [-1] | [0, -1]))
+    {
+        return Err(ValidationError::new("invalid_fl2va_frame_indices"));
+    }
+
+    match task {
+        "t2va" if total != 0 => {
+            return Err(ValidationError::new("t2va_references_not_allowed"));
+        }
+        "fl2va" if !(1..=2).contains(&image_count) || video_count != 0 || audio_count != 0 => {
+            return Err(ValidationError::new("invalid_fl2va_references"));
+        }
+        "fl2va"
+            if request
+                .nvext
+                .as_ref()
+                .and_then(|nvext| nvext.frame_indices.as_ref())
+                .is_some_and(|indices| indices.len() != image_count) =>
+        {
+            return Err(ValidationError::new("invalid_fl2va_frame_index_count"));
+        }
+        "ref2va"
+            if image_count + video_count == 0
+                || image_count > 9
+                || video_count > 3
+                || audio_count > 3
+                || total > 12 =>
+        {
+            return Err(ValidationError::new("invalid_ref2va_references"));
+        }
+        _ => {}
+    }
+
+    if let Some(start_times) = request
+        .nvext
+        .as_ref()
+        .and_then(|nvext| nvext.start_time_seconds.as_ref())
+    {
+        let valid = match start_times {
+            StartTimeSeconds::Scalar(_) => video_count == 1,
+            StartTimeSeconds::List(values) => values.len() == video_count,
+        };
+        if !valid {
+            return Err(ValidationError::new("invalid_start_time_count"));
+        }
     }
     Ok(())
 }
@@ -310,6 +412,119 @@ mod tests {
         }"#;
         let req: NvCreateVideoRequest = serde_json::from_str(json).unwrap();
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn video_request_h3_controls_round_trip() {
+        let json = r#"{
+            "prompt":"cat",
+            "model":"MiniMaxAI/MiniMax-H3",
+            "input_references":[
+                {"type":"image","source":"https://example.com/cat.png"}
+            ],
+            "nvext":{
+                "task":"ref2va",
+                "duration":4.0,
+                "audio_flow_shift":3.0,
+                "quality":"high"
+            }
+        }"#;
+        let req: NvCreateVideoRequest = serde_json::from_str(json).unwrap();
+        assert!(req.validate().is_ok());
+
+        let out = serde_json::to_string(&req).unwrap();
+        assert!(out.contains("\"task\":\"ref2va\""));
+    }
+
+    #[test]
+    fn video_request_rejects_invalid_h3_fps() {
+        let json = r#"{
+            "prompt":"cat",
+            "model":"MiniMaxAI/MiniMax-H3",
+            "nvext":{"task":"t2va","fps":16}
+        }"#;
+        let req: NvCreateVideoRequest = serde_json::from_str(json).unwrap();
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn video_request_rejects_too_many_typed_references() {
+        let references = (0..13)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": format!("https://example.com/{index}.png")
+                })
+            })
+            .collect::<Vec<_>>();
+        let request = serde_json::json!({
+            "prompt": "cat",
+            "model": "video-model",
+            "input_references": references,
+        });
+        let req: NvCreateVideoRequest = serde_json::from_value(request).unwrap();
+
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn video_request_rejects_invalid_h3_reference_contracts() {
+        for request in [
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [{"type": "image", "source": "cat.png"}],
+                "nvext": {"task": "t2va"},
+            }),
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [{"type": "image", "source": "cat.png"}],
+                "nvext": {"task": "fl2va", "frame_indices": [0, -1]},
+            }),
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [{"type": "video", "source": "cat.mp4"}],
+                "nvext": {"task": "ref2va", "start_time_seconds": [0.0, 1.0]},
+            }),
+        ] {
+            let req: NvCreateVideoRequest = serde_json::from_value(request).unwrap();
+            assert!(req.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn video_request_rejects_invalid_taskless_h3_reference_contracts() {
+        for request in [
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [{"type": "audio", "source": "cat.wav"}],
+            }),
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [
+                    {"type": "image", "source": "1.png"},
+                    {"type": "image", "source": "2.png"},
+                    {"type": "image", "source": "3.png"},
+                ],
+            }),
+            serde_json::json!({
+                "prompt": "cat",
+                "model": "MiniMaxAI/MiniMax-H3",
+                "input_references": [
+                    {"type": "video", "source": "1.mp4"},
+                    {"type": "video", "source": "2.mp4"},
+                    {"type": "video", "source": "3.mp4"},
+                    {"type": "video", "source": "4.mp4"},
+                ],
+            }),
+        ] {
+            let req: NvCreateVideoRequest = serde_json::from_value(request).unwrap();
+            assert!(req.validate().is_err());
+        }
     }
 
     // --- VideoData ---
