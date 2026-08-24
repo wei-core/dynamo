@@ -520,6 +520,16 @@ impl DeltaAggregator {
                 }
 
                 if let Some(family) = unified_family.as_deref() {
+                    // Only the guided-JSON success arm below returns a synthetic
+                    // empty `content` placeholder (there is no separate message
+                    // text distinct from the tool-call JSON itself). Every other
+                    // arm — the native-fallback-after-guided-error reconstruction,
+                    // and the plain non-guided `else` branch — returns REAL
+                    // stripped content from `parse_complete_unified` that must
+                    // always replace `choice.text`, matching the sibling Qwen3
+                    // block's unconditional assignment, regardless of whether any
+                    // tool calls were found.
+                    let mut content_is_guided_placeholder = false;
                     let parse_result = if parsing_options
                         .guided_tool_constraint
                         .installs_guided_json()
@@ -528,7 +538,10 @@ impl DeltaAggregator {
                             &choice.text,
                             &parsing_options.guided_tool_constraint,
                         ) {
-                            Ok(calls) => Ok((calls, String::new(), String::new())),
+                            Ok(calls) => {
+                                content_is_guided_placeholder = true;
+                                Ok((calls, String::new(), String::new()))
+                            }
                             Err(guided_error) => {
                                 match super::tool_parser_v2::parse_complete_unified(
                                     &choice.text,
@@ -578,7 +591,7 @@ impl DeltaAggregator {
                                     .get_or_insert_with(String::new)
                                     .push_str(&reasoning);
                             }
-                            if !calls_is_empty {
+                            if !calls_is_empty || !content_is_guided_placeholder {
                                 choice.text = content;
                             } else {
                                 tracing::warn!(

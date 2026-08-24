@@ -71,7 +71,7 @@ fn apply_request_tool_call_parsing_options(
         parsing_options.structural_tag_mode,
         parsing_options.structural_tag_scope,
         parsing_options.exclude_tools_when_tool_choice_none,
-    )
+    )?
     .is_required();
     let guided_tool_constraint = crate::preprocessor::tool_choice::guided_tool_constraint(
         request,
@@ -308,6 +308,180 @@ mod tests {
             result.is_err(),
             "a named tool_choice for a tool absent from `tools` must not resolve to a \
              bogus constraint"
+        );
+    }
+
+    // Regression for the CodeRabbit finding on PR #12576 (review comment 3836534587,
+    // filed against this file): `structural_tag_decision` returned `Required`
+    // without checking `tools`, so `guided_tool_constraint` skipped
+    // `get_json_schema_from_tools` entirely for the STRUCTURAL-TAG branch (it
+    // short-circuits to `Ok(StructuralTag)` whenever `uses_structural_tag` is true,
+    // without building or validating anything). The two `hermes` tests above only
+    // ever exercised the non-structural-tag JSON-schema fallback, which already
+    // validated correctly — they never covered the actual bug. Kimi K2 is the
+    // structural-tag-intrinsic parser, so this reproduces the real gap.
+    #[test]
+    fn kimi_k2_required_with_empty_tools_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": "required",
+            "tools": []
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("kimi_k2".to_string()),
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "kimi_k2 + required with no tools must not resolve to StructuralTag"
+        );
+    }
+
+    #[test]
+    fn kimi_k2_named_tool_choice_for_absent_tool_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": {"type": "function", "function": {"name": "does_not_exist"}},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]
+                    }
+                }
+            }]
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("kimi_k2".to_string()),
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "kimi_k2 + a named tool_choice for a tool absent from `tools` must not \
+             resolve to StructuralTag"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_named_tool_choice_for_absent_tool_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": {"type": "function", "function": {"name": "does_not_exist"}},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]
+                    }
+                }
+            }]
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("kimi_k3".to_string()),
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "kimi_k3 + a named tool_choice for a tool absent from `tools` must not \
+             resolve to StructuralTag"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_required_with_empty_tools_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": "required",
+            "tools": []
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("kimi_k3".to_string()),
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "kimi_k3 + required with no tools must be rejected before the XTML path"
+        );
+    }
+
+    // Same gap, operator-enabled path: qwen3_coder only gets a structural tag when
+    // `structural_tag_mode = On` (it is not Kimi-intrinsic). Confirms the fix isn't
+    // narrowly scoped to the two Kimi-intrinsic parsers.
+    #[test]
+    fn operator_enabled_qwen3_coder_required_with_empty_tools_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": "required",
+            "tools": []
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("qwen3_coder".to_string()),
+            structural_tag_mode: crate::local_model::runtime_config::StructuralTagMode::On,
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "operator-enabled qwen3_coder + required with no tools must not resolve \
+             to StructuralTag"
+        );
+    }
+
+    #[test]
+    fn operator_enabled_qwen3_coder_named_tool_choice_for_absent_tool_is_rejected() {
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "tool_choice": {"type": "function", "function": {"name": "does_not_exist"}},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]
+                    }
+                }
+            }]
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let parsing_options = ParsingOptions {
+            tool_call_parser: Some("qwen3_coder".to_string()),
+            structural_tag_mode: crate::local_model::runtime_config::StructuralTagMode::On,
+            ..Default::default()
+        };
+        let result = apply_request_tool_call_parsing_options(parsing_options, &request);
+        assert!(
+            result.is_err(),
+            "operator-enabled qwen3_coder + a named tool_choice for a tool absent from \
+             `tools` must not resolve to StructuralTag"
         );
     }
 }

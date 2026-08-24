@@ -22,6 +22,59 @@ pub enum ToolChoiceError {
     EmptyTools,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolChoiceValidation<'a> {
+    Unforced,
+    Required,
+    Named(&'a str),
+}
+
+/// Validate the forced-choice contract shared by wire and parser-facing tool types.
+pub(crate) fn validate_tool_choice_against_names<'a>(
+    tool_choice: ToolChoiceValidation<'_>,
+    tool_names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ToolChoiceError> {
+    let mut tool_names = tool_names.into_iter();
+    match tool_choice {
+        ToolChoiceValidation::Unforced => Ok(()),
+        ToolChoiceValidation::Required if tool_names.next().is_none() => {
+            Err(ToolChoiceError::EmptyTools)
+        }
+        ToolChoiceValidation::Named(name) if !tool_names.any(|tool_name| tool_name == name) => {
+            Err(ToolChoiceError::ToolNotFound(name.to_string()))
+        }
+        ToolChoiceValidation::Required | ToolChoiceValidation::Named(_) => Ok(()),
+    }
+}
+
+/// Validate an OpenAI `tool_choice` against the request's declared tools.
+pub(crate) fn validate_openai_tool_choice(
+    tool_choice: Option<&ChatCompletionToolChoiceOption>,
+    tools: Option<&[ChatCompletionTool]>,
+) -> Result<(), ToolChoiceError> {
+    let Some(tool_choice) = tool_choice else {
+        return Ok(());
+    };
+
+    match tool_choice {
+        ChatCompletionToolChoiceOption::None | ChatCompletionToolChoiceOption::Auto => Ok(()),
+        ChatCompletionToolChoiceOption::Required => {
+            let tools = tools.ok_or(ToolChoiceError::MissingTools)?;
+            validate_tool_choice_against_names(
+                ToolChoiceValidation::Required,
+                tools.iter().map(|tool| tool.function.name.as_str()),
+            )
+        }
+        ChatCompletionToolChoiceOption::Named(named) => {
+            let tools = tools.ok_or(ToolChoiceError::MissingTools)?;
+            validate_tool_choice_against_names(
+                ToolChoiceValidation::Named(&named.function.name),
+                tools.iter().map(|tool| tool.function.name.as_str()),
+            )
+        }
+    }
+}
+
 /// Builds the JSON schema enforced by Guided Decoding for the given tool_choice/tools pair.
 pub fn get_json_schema_from_tools(
     tool_choice: Option<&ChatCompletionToolChoiceOption>,
@@ -31,6 +84,7 @@ pub fn get_json_schema_from_tools(
     let Some(choice) = tool_choice else {
         return Ok(None);
     };
+    validate_openai_tool_choice(Some(choice), tools)?;
 
     match choice {
         ChatCompletionToolChoiceOption::None | ChatCompletionToolChoiceOption::Auto => Ok(None),
@@ -42,9 +96,6 @@ pub fn get_json_schema_from_tools(
         }
         ChatCompletionToolChoiceOption::Required => {
             let tools = tools.ok_or(ToolChoiceError::MissingTools)?;
-            if tools.is_empty() {
-                return Err(ToolChoiceError::EmptyTools);
-            }
             build_required_schema(tools, parallel_tool_calls).map(Some)
         }
     }

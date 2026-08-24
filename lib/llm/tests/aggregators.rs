@@ -748,7 +748,7 @@ async fn test_muse_unified_batch_finalize_suppresses_calls_when_disabled() {
 }
 
 // ===================================
-// DIS-2544 stage5b regression tests (Fix A/B/C)
+// Muse batch-finalize regression tests (Fix A/B/C)
 // ===================================
 
 /// Fix A: a guided-JSON response that legitimately contains zero tool calls
@@ -779,6 +779,37 @@ async fn test_muse_unified_batch_guided_json_zero_calls_preserves_original_text(
         raw,
         "a guided-JSON parse that returns zero calls must preserve the original raw \
          text instead of blanking choice.text to empty"
+    );
+}
+
+/// Devin Review finding (PR #12576): the muse batch finalize's zero-calls guard
+/// must only preserve raw text for the guided-JSON placeholder-content case
+/// (Fix A). A plain muse turn with NO tool call at all is the common case for
+/// muse responses and must have its markup stripped just like the sibling
+/// Qwen3 block does unconditionally — before this fix, ANY zero-calls result
+/// (not just the guided-JSON placeholder) skipped `choice.text = content`,
+/// leaking raw `<|start|>...<|message|>` control tokens to the client.
+#[tokio::test]
+async fn test_muse_unified_batch_toolless_response_strips_markup() {
+    let raw = "<|start|>assistant to=user<|message|>Hello there.<|eot|>";
+    let result = NvCreateChatCompletionResponse::from_annotated_stream(
+        futures::stream::iter([make_stream_delta(Some(raw), None)]),
+        ParsingOptions::new(Some("muse_glimmer".to_string()), None),
+    )
+    .await
+    .unwrap();
+
+    let choice = result.inner.choices.first().expect("one choice");
+    assert!(
+        choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty),
+        "a plain toolless muse turn must not produce any tool_calls: {:?}",
+        choice.message.tool_calls
+    );
+    assert_eq!(
+        get_text(choice.message.content.as_ref().expect("content")),
+        "Hello there.",
+        "a toolless muse response must have its markup stripped, not leak raw \
+         control tokens as content"
     );
 }
 
@@ -879,5 +910,44 @@ async fn test_hermes_batch_guided_json_failure_ignores_quoted_marker_substring()
         raw,
         "content whose only marker-looking span is quoted illustrative prose must \
          pass through unparsed rather than be misclassified as native tool-call markup"
+    );
+}
+
+/// CodeRabbit finding (PR #12576, Major): the native-fallback-after-guided-error
+/// path can recover real reasoning/content while finding zero tool calls (e.g. a
+/// guided-JSON-required request whose model output isn't valid JSON at all, but
+/// carries recognizable native muse markup). Before the fix this shared the same
+/// `!calls_is_empty` gate as the guided-JSON placeholder case, so the recovered
+/// content was discarded and raw markup stayed in `choice.text` even though this
+/// branch's `content` is real stripped text, not a synthetic placeholder.
+#[tokio::test]
+async fn test_muse_unified_batch_native_fallback_zero_calls_still_strips_markup() {
+    let raw = "<|start|>assistant to=self<|message|>Look it up.<|eom|>\
+               <|start|>assistant to=user<|message|>It's 18C.<|eot|>";
+    let result = NvCreateChatCompletionResponse::from_annotated_stream(
+        futures::stream::iter([make_stream_delta(Some(raw), None)]),
+        ParsingOptions::new(Some("muse_glimmer".to_string()), None)
+            .with_guided_tool_constraint(GuidedToolConstraint::GuidedJsonRequired),
+    )
+    .await
+    .unwrap();
+
+    let choice = result.inner.choices.first().expect("one choice");
+    assert!(
+        choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty),
+        "no tool call is present in this fixture: {:?}",
+        choice.message.tool_calls
+    );
+    assert_eq!(
+        choice.message.reasoning_content.as_deref(),
+        Some("Look it up."),
+        "the native fallback must still recover reasoning"
+    );
+    assert_eq!(
+        get_text(choice.message.content.as_ref().expect("content")),
+        "It's 18C.",
+        "the native fallback's real recovered content must replace choice.text \
+         even when zero tool calls were found, not be discarded as if it were the \
+         guided-JSON synthetic placeholder"
     );
 }

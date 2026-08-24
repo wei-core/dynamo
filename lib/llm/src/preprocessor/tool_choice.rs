@@ -6,7 +6,7 @@
 use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
 use crate::protocols::openai::GuidedToolConstraint;
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
-use crate::protocols::openai::tools::get_json_schema_from_tools;
+use crate::protocols::openai::tools::{get_json_schema_from_tools, validate_openai_tool_choice};
 
 use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
 use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolChoiceOption, ResponseFormat};
@@ -217,6 +217,8 @@ pub(crate) fn guided_tool_constraint(
         .tool_choice
         .as_ref()
         .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
+    validate_openai_tool_choice(Some(tool_choice), request.inner.tools.as_deref())
+        .map_err(|error| invalid_argument(error.to_string()))?;
     let is_forced_tool_choice = matches!(
         tool_choice,
         ChatCompletionToolChoiceOption::Required | ChatCompletionToolChoiceOption::Named(_)
@@ -457,5 +459,20 @@ mod tests {
         assert!(!uses_kimi_k3_parser(None, None));
         assert!(!uses_kimi_k3_parser(Some("kimi_k2"), Some("qwen3")));
         assert!(!uses_kimi_k3_parser(Some("qwen3_coder"), None));
+    }
+
+    #[test]
+    fn kimi_k3_required_without_tools_is_rejected_before_the_xtml_return() {
+        for extra in [
+            json!({"tool_choice": "required"}),
+            json!({"tool_choice": "required", "tools": []}),
+        ] {
+            let request = request(extra);
+            let result = guided_tool_constraint(&request, Some("kimi_k3"), None, false);
+            assert!(
+                result.is_err(),
+                "Kimi K3 required must reject both missing and empty tools"
+            );
+        }
     }
 }
