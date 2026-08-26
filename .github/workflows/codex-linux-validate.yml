@@ -1,0 +1,43 @@
+name: Codex Linux validation
+
+on:
+  push:
+    branches:
+      - codex/validate-kv-router-trace-context-v2
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libzmq3-dev protobuf-compiler
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          protoc --version
+          rustup component add rustfmt clippy
+
+      - name: Check formatting and locked metadata
+        run: |
+          cargo fmt --all -- --check
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo metadata --manifest-path lib/bindings/python/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+          cargo metadata --manifest-path lib/runtime/examples/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+          cargo metadata --manifest-path lib/bindings/kvbm/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+
+      - name: Run KV router trace propagation test
+        run: cargo test --locked -p dynamo-llm --no-default-features route_request_span_propagates_distributed_trace_context -- --nocapture
+
+      - name: Run targeted clippy
+        run: cargo clippy --locked -p dynamo-llm --no-default-features --lib --tests -- -D warnings
